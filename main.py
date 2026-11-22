@@ -1,153 +1,137 @@
 #!/usr/bin/env python3
-"""News image, Sunday 22 November 2026 — copy the finished front page.
+"""
+main.py -- entrypoint for the make.fun bounty news-image-20261122.
 
-The page itself is already rendered and stored next to this script as
-``entry.png``.  This program does no drawing at all: it only checks that
-the stored file is a whole, well-formed PNG of the expected size and
-then copies its bytes unchanged to the output directory.
+The entry is a single newspaper front page, entry.png, bundled in this
+repository next to this file. The picture itself is drawn by a separate
+workshop script; this program's job is narrower: prove the bundled
+file is a well-formed PNG inside the bounty's limits, then place an
+unchanged copy where the grader looks for it.
 
-Only the Python standard library is used, so the program runs in a
-bare container with no third-party packages installed.  There is no
-network access, no clock reading and no randomness, so every run
-writes exactly the same bytes.
+Checks, in order:
+  * the file exists and is at most 1 MiB;
+  * it starts with the eight-byte PNG signature;
+  * it parses as a sequence of chunks, each with a valid CRC;
+  * the first chunk is IHDR and its dimensions are at most 1024x1024;
+  * at least one IDAT chunk carries the picture data;
+  * the last chunk is IEND and nothing follows it.
+
+The copy lands in the directory named by MAKEFUN_OUTPUT_DIR
+(default /output) as entry.png. Any failed check exits non-zero and
+nothing is written.
+
+Standard library only: binascii, os, struct, sys.
 """
 
 import binascii
-import hashlib
 import os
 import struct
 import sys
 
-SOURCE_NAME = "entry.png"
-TARGET_NAME = "entry.png"
-
-# The competition caps the entry image at 1024 by 1024 pixels and 1 MiB.
-MAX_WIDTH = 1024
-MAX_HEIGHT = 1024
-MAX_BYTES = 1024 * 1024
-
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-IHDR_LENGTH = 13
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+SIZE_LIMIT = 1024 * 1024          # one mebibyte, the bounty's cap
+SIDE_LIMIT = 1024                 # neither side may exceed this
 
 
 def fail(message):
-    """Print an error to stderr and exit non-zero."""
-    sys.stderr.write("error: %s\n" % message)
+    print("main.py: " + message, file=sys.stderr)
     return 1
 
 
-def source_path():
-    """Locate entry.png: beside this script, or under MAKEFUN_BOT_DIR."""
-    bot_dir = os.environ.get("MAKEFUN_BOT_DIR")
-    if bot_dir:
-        return os.path.join(bot_dir, SOURCE_NAME)
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, SOURCE_NAME)
+def read_chunks(blob):
+    """Yield (kind, payload) for each chunk after the signature.
 
-
-def output_path():
-    """Locate the destination: MAKEFUN_OUTPUT_DIR/entry.png."""
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    return os.path.join(outdir, TARGET_NAME)
-
-
-def check_png(data):
-    """Validate the PNG bytes; return (width, height) or raise ValueError."""
-    if len(data) > MAX_BYTES:
-        raise ValueError(
-            "file is %d bytes, over the %d byte limit" % (len(data), MAX_BYTES)
-        )
-    if len(data) < len(PNG_SIGNATURE) + 8 + IHDR_LENGTH + 12:
-        raise ValueError("file is too short to be a PNG")
-    if data[:8] != PNG_SIGNATURE:
-        raise ValueError("missing PNG signature")
-
-    # The first chunk must be IHDR: 4-byte length, "IHDR", 13 data bytes.
-    length = struct.unpack(">I", data[8:12])[0]
-    if data[12:16] != b"IHDR" or length != IHDR_LENGTH:
-        raise ValueError("first chunk is not IHDR")
-    width, height = struct.unpack(">II", data[16:24])
-    if width < 1 or height < 1:
-        raise ValueError("image has zero width or height")
-    if width > MAX_WIDTH or height > MAX_HEIGHT:
-        raise ValueError(
-            "image is %dx%d, over the %dx%d limit"
-            % (width, height, MAX_WIDTH, MAX_HEIGHT)
-        )
-
-    # Walk the chunk list to the end: every chunk must fit inside the
-    # file, carry a matching CRC, and the last one must be IEND.  A real
-    # image also needs at least one IDAT chunk carrying pixel data.
-    offset = 8
-    seen_iend = False
-    seen_idat = False
-    while offset < len(data):
-        if offset + 8 > len(data):
-            raise ValueError("truncated chunk header at offset %d" % offset)
-        chunk_len = struct.unpack(">I", data[offset:offset + 4])[0]
-        chunk_type = data[offset + 4:offset + 8]
-        end = offset + 12 + chunk_len
-        if end > len(data):
-            raise ValueError("chunk %r overruns the file" % chunk_type)
-        stored_crc = struct.unpack(">I", data[offset + 8 + chunk_len: end])[0]
-        actual_crc = binascii.crc32(data[offset + 4:offset + 8 + chunk_len])
-        actual_crc &= 0xFFFFFFFF
+    Raises ValueError on any structural problem: a truncated header,
+    a length that runs past the end of the file, or a CRC mismatch.
+    """
+    pos = len(PNG_MAGIC)
+    end = len(blob)
+    while pos < end:
+        if pos + 8 > end:
+            raise ValueError("truncated chunk header at byte %d" % pos)
+        (length,) = struct.unpack(">I", blob[pos:pos + 4])
+        kind = blob[pos + 4:pos + 8]
+        payload_start = pos + 8
+        payload_end = payload_start + length
+        crc_end = payload_end + 4
+        if crc_end > end:
+            raise ValueError("chunk %r overruns the file" % kind)
+        payload = blob[payload_start:payload_end]
+        (stored_crc,) = struct.unpack(">I", blob[payload_end:crc_end])
+        actual_crc = binascii.crc32(kind + payload) & 0xFFFFFFFF
         if stored_crc != actual_crc:
-            raise ValueError("bad CRC in chunk %r" % chunk_type)
-        if chunk_type == b"IDAT":
-            seen_idat = True
-        if chunk_type == b"IEND":
-            if chunk_len != 0:
-                raise ValueError("IEND chunk must be empty")
-            if end != len(data):
-                raise ValueError("trailing bytes after IEND")
-            seen_iend = True
-            break
-        offset = end
-    if not seen_iend:
-        raise ValueError("missing IEND chunk")
-    if not seen_idat:
-        raise ValueError("no IDAT chunk: image carries no pixel data")
+            raise ValueError("CRC mismatch in chunk %r" % kind)
+        yield kind, payload
+        pos = crc_end
+    if pos != end:
+        raise ValueError("trailing bytes after the final chunk")
+
+
+def inspect(blob):
+    """Return (width, height) if blob is an acceptable PNG, else raise."""
+    if len(blob) > SIZE_LIMIT:
+        raise ValueError("file is %d bytes, over the 1 MiB limit" % len(blob))
+    if not blob.startswith(PNG_MAGIC):
+        raise ValueError("missing PNG signature")
+    kinds = []
+    width = height = None
+    for kind, payload in read_chunks(blob):
+        kinds.append(kind)
+        if kind == b"IHDR":
+            if len(payload) != 13:
+                raise ValueError("IHDR payload is not 13 bytes")
+            width, height = struct.unpack(">II", payload[:8])
+    if not kinds or kinds[0] != b"IHDR":
+        raise ValueError("first chunk is not IHDR")
+    if kinds[-1] != b"IEND":
+        raise ValueError("last chunk is not IEND")
+    if b"IDAT" not in kinds:
+        raise ValueError("no IDAT chunk: the picture data is missing")
+    if width is None or width < 1 or height < 1:
+        raise ValueError("IHDR reports a degenerate picture size")
+    if width > SIDE_LIMIT or height > SIDE_LIMIT:
+        raise ValueError("picture is %dx%d, over the %dx%d limit"
+                         % (width, height, SIDE_LIMIT, SIDE_LIMIT))
     return width, height
+
+
+def source_path():
+    """The bundled picture sits beside this file in the repository."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "entry.png")
+
+
+def destination_path():
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    return out_dir, os.path.join(out_dir, "entry.png")
 
 
 def main():
     src = source_path()
+    if not os.path.isfile(src):
+        return fail("bundled entry.png not found next to main.py")
+    with open(src, "rb") as handle:
+        blob = handle.read()
     try:
-        with open(src, "rb") as handle:
-            data = handle.read()
-    except OSError as exc:
-        return fail("cannot read %s: %s" % (src, exc))
+        width, height = inspect(blob)
+    except ValueError as problem:
+        return fail("entry.png rejected: %s" % problem)
 
+    out_dir, dst = destination_path()
     try:
-        width, height = check_png(data)
-    except ValueError as exc:
-        return fail("%s is not a valid entry image: %s" % (src, exc))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(dst, "wb") as handle:
+            handle.write(blob)
+    except OSError as problem:
+        return fail("could not write %s: %s" % (dst, problem))
 
-    dest = output_path()
-    if os.path.abspath(src) == os.path.abspath(dest):
-        return fail("source and destination are the same file: %s" % src)
-    try:
-        parent = os.path.dirname(dest)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(dest, "wb") as handle:
-            handle.write(data)
-    except OSError as exc:
-        return fail("cannot write %s: %s" % (dest, exc))
-
-    # Read the copy back and confirm it matches the source byte for byte
-    # before reporting success, so a truncated write can never pass.
-    try:
-        with open(dest, "rb") as handle:
-            written = handle.read()
-    except OSError as exc:
-        return fail("cannot read back %s: %s" % (dest, exc))
-    if written != data:
-        return fail("written file differs from %s" % src)
-
-    digest = hashlib.sha256(data).hexdigest()
-    print("wrote %s (%dx%d, %d bytes, sha256 %s)" % (dest, width, height, len(data), digest))
+    # Read the copy back: the grader must receive the identical bytes.
+    with open(dst, "rb") as handle:
+        written = handle.read()
+    if written != blob:
+        return fail("written copy differs from the bundled picture")
+    print("main.py: entry.png verified (%dx%d, %d bytes) and copied to %s"
+          % (width, height, len(blob), dst))
     return 0
 
 
